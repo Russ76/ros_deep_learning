@@ -20,42 +20,84 @@
  * DEALINGS IN THE SOFTWARE.
  */
 
-#include <ros/ros.h>
-
-#include <sensor_msgs/Image.h>
-#include <vision_msgs/Classification2D.h>
-#include <vision_msgs/VisionInfo.h>
+#include "ros_compat.h"
+#include "image_converter.h"
 
 #include <jetson-inference/imageNet.h>
-#include <jetson-utils/cudaMappedMemory.h>
-
-#include "image_converter.h"
+#include <jetson-utils/cudaFont.h>
 
 #include <unordered_map>
 
 
 // globals
-imageNet* 	 net = NULL;
-imageConverter* cvt = NULL;
+imageNet* net = NULL;
+cudaFont* font = NULL;
 
-ros::Publisher* classify_pub = NULL;
+imageConverter* input_cvt = NULL;
+imageConverter* overlay_cvt = NULL;
+
+Publisher<vision_msgs::Classification2D> classify_pub = NULL;
+Publisher<sensor_msgs::Image> overlay_pub = NULL;
+Publisher<vision_msgs::VisionInfo> info_pub = NULL;
 
 vision_msgs::VisionInfo info_msg;
 
 
-// callback triggered when a new subscriber connected to vision_info topic
-void info_connect( const ros::SingleSubscriberPublisher& pub )
+// triggered when a new subscriber connected
+void info_callback()
 {
-	ROS_INFO("new subscriber '%s' connected to vision_info topic '%s', sending VisionInfo msg", pub.getSubscriberName().c_str(), pub.getTopic().c_str());
-	pub.publish(info_msg);
+	ROS_INFO("new subscriber connected to vision_info topic, sending VisionInfo msg");
+	info_pub->publish(info_msg);
+}	
+
+
+// publish overlay image
+bool publish_overlay( int img_class, float confidence )
+{
+	// create font for image overlay
+	font = cudaFont::Create();
+	
+	if( !font )
+	{
+		ROS_ERROR("failed to load font for overlay");
+		return false;
+	}
+
+	// get the image dimensions
+	const uint32_t width  = input_cvt->GetWidth();
+	const uint32_t height = input_cvt->GetHeight();
+
+	// assure correct image size
+	if( !overlay_cvt->Resize(width, height, imageConverter::ROSOutputFormat) )
+		return false;
+
+	// generate the overlay
+	char str[256];
+	sprintf(str, "%05.2f%% %s", confidence * 100.0f, net->GetClassDesc(img_class));
+
+	font->OverlayText(input_cvt->ImageGPU(), width, height,
+			        str, 5, 5, make_float4(255, 255, 255, 255), make_float4(0, 0, 0, 100));
+
+	// populate the message
+	sensor_msgs::Image msg;
+
+	if( !overlay_cvt->Convert(msg, imageConverter::ROSOutputFormat, input_cvt->ImageGPU()) )
+		return false;
+
+	// populate timestamp in header field
+	msg.header.stamp = ROS_TIME_NOW();
+
+	// publish the message	
+	overlay_pub->publish(msg);
+	ROS_DEBUG("publishing %ux%u overlay image", width, height);
 }
 
 
-// callback triggered when recieved a new image on input topic
-void img_callback( const sensor_msgs::ImageConstPtr& input )
+// triggered when recieved a new image on input topic
+void img_callback( const sensor_msgs::ImageConstPtr input )
 {
 	// convert the image to reside on GPU
-	if( !cvt || !cvt->Convert(input) )
+	if( !input_cvt || !input_cvt->Convert(input) )
 	{
 		ROS_INFO("failed to convert %ux%u %s image", input->width, input->height, input->encoding.c_str());
 		return;	
@@ -63,9 +105,8 @@ void img_callback( const sensor_msgs::ImageConstPtr& input )
 
 	// classify the image
 	float confidence = 0.0f;
-	const int img_class = net->Classify(cvt->ImageGPU(), cvt->GetWidth(), cvt->GetHeight(), &confidence);
+	const int img_class = net->Classify(input_cvt->ImageGPU(), input_cvt->GetWidth(), input_cvt->GetHeight(), &confidence);
 	
-
 	// verify the output	
 	if( img_class >= 0 )
 	{
@@ -80,8 +121,15 @@ void img_callback( const sensor_msgs::ImageConstPtr& input )
 
 		msg.results.push_back(obj);	// TODO optionally add source image to msg
 	
+		// populate timestamp in header field
+		msg.header.stamp = ROS_TIME_NOW();
+
 		// publish the classification message
 		classify_pub->publish(msg);
+
+		// generate the overlay (if there are subscribers)
+		if( ROS_NUM_SUBSCRIBERS(overlay_pub) > 0 )
+			publish_overlay(img_class, confidence);
 	}
 	else
 	{
@@ -94,36 +142,54 @@ void img_callback( const sensor_msgs::ImageConstPtr& input )
 // node main loop
 int main(int argc, char **argv)
 {
-	ros::init(argc, argv, "imagenet");
- 
-	ros::NodeHandle nh;
-	ros::NodeHandle private_nh("~");
+	/*
+	 * create node instance
+	 */
+	ROS_CREATE_NODE("imagenet");
+
+
+	/*
+	 * declare parameters
+	 */
+	std::string model_name = "googlenet";
+	std::string model_path;	
+	std::string prototxt_path;
+	std::string class_labels_path;
+	
+	std::string input_blob = IMAGENET_DEFAULT_INPUT;
+	std::string output_blob = IMAGENET_DEFAULT_OUTPUT;
+
+	ROS_DECLARE_PARAMETER("model_name", model_name);
+	ROS_DECLARE_PARAMETER("model_path", model_path);
+	ROS_DECLARE_PARAMETER("prototxt_path", prototxt_path);
+	ROS_DECLARE_PARAMETER("class_labels_path", class_labels_path);
+	ROS_DECLARE_PARAMETER("input_blob", input_blob);
+	ROS_DECLARE_PARAMETER("output_blob", output_blob);
+
 
 	/*
 	 * retrieve parameters
 	 */
-	std::string class_labels_path;
-	std::string prototxt_path;
-	std::string model_path;
-	std::string model_name;
-
-	bool use_model_name = false;
-
-	// determine if custom model paths were specified
-	if( !private_nh.getParam("prototxt_path", prototxt_path) ||
-	    !private_nh.getParam("model_path", model_path) ||
-	    !private_nh.getParam("class_labels_path", class_labels_path) )
-	{
-		// without custom model, use one of the built-in pretrained models
-		private_nh.param<std::string>("model_name", model_name, "googlenet");
-		use_model_name = true;
-	}
+	ROS_GET_PARAMETER("model_name", model_name);
+	ROS_GET_PARAMETER("model_path", model_path);
+	ROS_GET_PARAMETER("prototxt_path", prototxt_path);
+	ROS_GET_PARAMETER("class_labels_path", class_labels_path);
+	ROS_GET_PARAMETER("input_blob", input_blob);
+	ROS_GET_PARAMETER("output_blob", output_blob);
 
 	
 	/*
 	 * load image recognition network
 	 */
-	if( use_model_name )
+	if( model_path.size() > 0 )
+	{
+		// create network using custom model paths
+		net = imageNet::Create(prototxt_path.c_str(), model_path.c_str(),
+						   NULL, class_labels_path.c_str(), 
+						   input_blob.c_str(), output_blob.c_str());
+
+	}
+	else
 	{
 		// determine which built-in model was requested
 		imageNet::NetworkType model = imageNet::NetworkTypeFromStr(model_name.c_str());
@@ -136,11 +202,6 @@ int main(int argc, char **argv)
 
 		// create network using the built-in model
 		net = imageNet::Create(model);
-	}
-	else
-	{
-		// create network using custom model paths
-		net = imageNet::Create(prototxt_path.c_str(), model_path.c_str(), NULL, class_labels_path.c_str());
 	}
 
 	if( !net )
@@ -167,12 +228,15 @@ int main(int argc, char **argv)
 	for( uint32_t n=0; n < num_classes; n++ )
 		class_descriptions.push_back(net->GetClassDesc(n));
 
+
 	// create the key on the param server
 	std::string class_key = std::string("class_labels_") + std::to_string(model_hash);
-	private_nh.setParam(class_key, class_descriptions);
-		
+
+	ROS_DECLARE_PARAMETER(class_key, class_descriptions);
+	ROS_SET_PARAMETER(class_key, class_descriptions);
+	
 	// populate the vision info msg
-	std::string node_namespace = private_nh.getNamespace();
+	const std::string node_namespace = ROS_GET_NAMESPACE();
 	ROS_INFO("node namespace => %s", node_namespace.c_str());
 
 	info_msg.database_location = node_namespace + std::string("/") + class_key;
@@ -183,13 +247,14 @@ int main(int argc, char **argv)
 
 
 	/*
-	 * create an image converter object
+	 * create image converter objects
 	 */
-	cvt = new imageConverter();
-	
-	if( !cvt )
+	input_cvt = new imageConverter();
+	overlay_cvt = new imageConverter();
+
+	if( !input_cvt || !overlay_cvt )
 	{
-		ROS_ERROR("failed to create imageConverter object");
+		ROS_ERROR("failed to create imageConverter objects");
 		return 0;
 	}
 
@@ -197,27 +262,31 @@ int main(int argc, char **argv)
 	/*
 	 * advertise publisher topics
 	 */
-	ros::Publisher pub = private_nh.advertise<vision_msgs::Classification2D>("classification", 5);
-	classify_pub = &pub; // we need to publish from the subscriber callback
-
-	// the vision info topic only publishes upon a new connection
-	ros::Publisher info_pub = private_nh.advertise<vision_msgs::VisionInfo>("vision_info", 1, (ros::SubscriberStatusCallback)info_connect);
+	ROS_CREATE_PUBLISHER(vision_msgs::Classification2D, "classification", 5, classify_pub);
+	ROS_CREATE_PUBLISHER(sensor_msgs::Image, "overlay", 2, overlay_pub);
+		
+	ROS_CREATE_PUBLISHER_STATUS(vision_msgs::VisionInfo, "vision_info", 1, info_callback, info_pub);
 
 
 	/*
 	 * subscribe to image topic
 	 */
-	//image_transport::ImageTransport it(nh);	// BUG - stack smashing on TX2?
-	//image_transport::Subscriber img_sub = it.subscribe("image", 1, img_callback);
-	ros::Subscriber img_sub = private_nh.subscribe("image_in", 5, img_callback);
-	
+	auto img_sub = ROS_CREATE_SUBSCRIBER(sensor_msgs::Image, "image_in", 5, img_callback);
+
 
 	/*
 	 * wait for messages
 	 */
 	ROS_INFO("imagenet node initialized, waiting for messages");
+	ROS_SPIN();
 
-	ros::spin();
+
+	/*
+	 * free resources
+	 */
+	delete net;
+	delete input_cvt;
+	delete overlay_cvt;
 
 	return 0;
 }
